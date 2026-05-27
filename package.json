@@ -1,0 +1,13 @@
+{
+  "name": "weflow-hermes-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "push": "node src/push-weflow-chatlab.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
