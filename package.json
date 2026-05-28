@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "push": "node src/push-weflow-chatlab.mjs"
+    "push": "node src/push-weflow-chatlab.mjs",
+    "host:start": "bin/start-host-services",
+    "host:check": "bin/start-host-services --check"
   },
   "engines": {
     "node": ">=20"

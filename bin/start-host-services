@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+ALIST_CONTAINER="${ALIST_CONTAINER:-alist}"
+WEFLOW_APP_DIR="${WEFLOW_APP_DIR:-/home/yangsan/github/WeFlow}"
+WEFLOW_UNIT="${WEFLOW_UNIT:-weflow-dev}"
+WEFLOW_UNIT="${WEFLOW_UNIT%.service}"
+WEFLOW_PROJECT_NAME="${WEFLOW_PROJECT_NAME:-weflow}"
+WEFLOW_SYNC_REMOTE="${WEFLOW_SYNC_REMOTE:-quark-alist:/quark/WeFlow-Hermes}"
+WEFLOW_SYNC_REMOTE="${WEFLOW_SYNC_REMOTE%/}"
+WEFLOW_SYNC_RCLONE_BIN="${WEFLOW_SYNC_RCLONE_BIN:-rclone}"
+NPM_BIN="${WEFLOW_NPM_BIN:-$(command -v npm || true)}"
+
+CHECK_ONLY=0
+RUN_SYNC=0
+RUN_DRY_RUN=0
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Start and verify the WeFlow Hermes host-side services.
+
+Options:
+  --check      Only check readiness; do not start stopped services.
+  --sync       Run one real npm run push after services are ready.
+  --dry-run    Run npm run push -- --dry-run --no-upload after services are ready.
+  -h, --help   Show this help.
+
+Environment overrides:
+  ALIST_CONTAINER       Docker container name. Default: alist
+  WEFLOW_APP_DIR        WeFlow source/app directory. Default: /home/yangsan/github/WeFlow
+  WEFLOW_UNIT           User systemd unit name. Default: weflow-dev
+  WEFLOW_PROJECT_NAME   Electron Store project name. Default: weflow
+  WEFLOW_NPM_BIN        npm executable path.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      ;;
+    --sync)
+      RUN_SYNC=1
+      ;;
+    --dry-run)
+      RUN_DRY_RUN=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '[FAIL] Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [ "$RUN_SYNC" -eq 1 ] && [ "$RUN_DRY_RUN" -eq 1 ]; then
+  printf '[FAIL] Use only one of --sync or --dry-run.\n' >&2
+  exit 2
+fi
+
+info() {
+  printf '[INFO] %s\n' "$*"
+}
+
+ok() {
+  printf '[ OK ] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[FAIL] %s\n' "$*" >&2
+}
+
+port_listening() {
+  local port="$1"
+  ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
+}
+
+wait_for_port() {
+  local port="$1"
+  local timeout_seconds="${2:-30}"
+  local elapsed=0
+
+  while [ "$elapsed" -lt "$timeout_seconds" ]; do
+    if port_listening "$port"; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  return 1
+}
+
+docker_container_running() {
+  docker ps --format '{{.Names}}' | grep -Fxq "$ALIST_CONTAINER"
+}
+
+docker_container_exists() {
+  docker ps -a --format '{{.Names}}' | grep -Fxq "$ALIST_CONTAINER"
+}
+
+start_alist() {
+  if ! command -v docker >/dev/null 2>&1; then
+    fail 'docker is not installed or not in PATH.'
+    return 1
+  fi
+
+  if docker_container_running; then
+    ok "AList Docker container '$ALIST_CONTAINER' is running."
+  else
+    if port_listening 5244; then
+      fail "Port 5244 is already listening, but Docker container '$ALIST_CONTAINER' is not running."
+      fail 'Stop the conflicting AList process or change the container/port before starting Docker AList.'
+      return 1
+    fi
+
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+      fail "AList Docker container '$ALIST_CONTAINER' is not running."
+      return 1
+    fi
+
+    if ! docker_container_exists; then
+      fail "AList Docker container '$ALIST_CONTAINER' does not exist."
+      return 1
+    fi
+
+    info "Starting AList Docker container '$ALIST_CONTAINER'..."
+    if ! docker start "$ALIST_CONTAINER" >/dev/null; then
+      fail "Failed to start Docker container '$ALIST_CONTAINER'."
+      return 1
+    fi
+    ok "AList Docker container '$ALIST_CONTAINER' started."
+  fi
+
+  if wait_for_port 5244 20; then
+    ok 'AList WebDAV port 5244 is listening.'
+    return 0
+  fi
+
+  fail 'AList did not open port 5244 in time.'
+  return 1
+}
+
+weflow_service_active() {
+  systemctl --user is-active --quiet "$WEFLOW_UNIT.service" 2>/dev/null
+}
+
+start_weflow() {
+  if port_listening 5031; then
+    ok 'WeFlow HTTP API port 5031 is listening.'
+    return 0
+  fi
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    fail 'WeFlow HTTP API port 5031 is not listening.'
+    return 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1 || ! command -v systemd-run >/dev/null 2>&1; then
+    fail 'systemd user tools are required to start WeFlow as a background service.'
+    return 1
+  fi
+
+  if [ ! -f "$WEFLOW_APP_DIR/package.json" ]; then
+    fail "WeFlow app directory is invalid: $WEFLOW_APP_DIR"
+    return 1
+  fi
+
+  if [ -z "$NPM_BIN" ] || [ ! -x "$NPM_BIN" ]; then
+    fail 'npm executable was not found. Set WEFLOW_NPM_BIN to the full npm path.'
+    return 1
+  fi
+
+  if weflow_service_active; then
+    info "WeFlow user service '$WEFLOW_UNIT.service' is active; waiting for port 5031..."
+  else
+    systemctl --user stop "$WEFLOW_UNIT.service" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$WEFLOW_UNIT.service" >/dev/null 2>&1 || true
+
+    local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    local dbus_addr="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$runtime_dir/bus}"
+    local display_value="${DISPLAY:-:0}"
+    local wayland_value="${WAYLAND_DISPLAY:-wayland-0}"
+    local path_value="$PATH"
+
+    info "Starting WeFlow with user service '$WEFLOW_UNIT.service'..."
+    if ! systemd-run --user \
+      --unit="$WEFLOW_UNIT" \
+      --collect \
+      --working-directory="$WEFLOW_APP_DIR" \
+      --setenv="WEFLOW_PROJECT_NAME=$WEFLOW_PROJECT_NAME" \
+      --setenv=ELECTRON_ENABLE_LOGGING=1 \
+      --setenv="DISPLAY=$display_value" \
+      --setenv="WAYLAND_DISPLAY=$wayland_value" \
+      --setenv="XDG_RUNTIME_DIR=$runtime_dir" \
+      --setenv="DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
+      --setenv="PATH=$path_value" \
+      --property=Restart=on-failure \
+      --property=RestartSec=3 \
+      "$NPM_BIN" run dev >/dev/null; then
+      fail "Failed to start WeFlow user service '$WEFLOW_UNIT.service'."
+      return 1
+    fi
+  fi
+
+  if wait_for_port 5031 45; then
+    ok 'WeFlow HTTP API port 5031 is listening.'
+    return 0
+  fi
+
+  fail 'WeFlow did not open port 5031 in time.'
+  fail "Inspect logs with: journalctl --user -u $WEFLOW_UNIT.service -n 120 --no-pager"
+  return 1
+}
+
+check_rclone() {
+  if ! command -v "$WEFLOW_SYNC_RCLONE_BIN" >/dev/null 2>&1; then
+    fail "rclone executable was not found: $WEFLOW_SYNC_RCLONE_BIN"
+    return 1
+  fi
+
+  if "$WEFLOW_SYNC_RCLONE_BIN" lsf "$WEFLOW_SYNC_REMOTE/inbox" >/dev/null; then
+    ok "rclone can list $WEFLOW_SYNC_REMOTE/inbox."
+    return 0
+  fi
+
+  fail "rclone cannot list $WEFLOW_SYNC_REMOTE/inbox."
+  return 1
+}
+
+check_cron() {
+  local cron_text
+  cron_text="$(crontab -l 2>/dev/null || true)"
+
+  if printf '%s\n' "$cron_text" | grep -Fq "$ROOT_DIR" && \
+    printf '%s\n' "$cron_text" | grep -Fq 'npm run push'; then
+    ok 'Hourly cron sync entry is present.'
+    return 0
+  fi
+
+  warn 'Hourly cron sync entry was not found. Services are up, but automatic sync may not run.'
+  return 0
+}
+
+run_optional_sync() {
+  cd "$ROOT_DIR"
+
+  if [ "$RUN_DRY_RUN" -eq 1 ]; then
+    info 'Running dry-run sync check...'
+    npm run push -- --dry-run --no-upload
+    return 0
+  fi
+
+  if [ "$RUN_SYNC" -eq 1 ]; then
+    info 'Running one real sync...'
+    npm run push
+    return 0
+  fi
+}
+
+main() {
+  local failed=0
+
+  info "Project: $ROOT_DIR"
+  info "WeFlow app: $WEFLOW_APP_DIR"
+  info "Remote: $WEFLOW_SYNC_REMOTE"
+
+  if ! start_alist; then
+    failed=1
+  fi
+
+  if ! start_weflow; then
+    failed=1
+  fi
+
+  if ! check_rclone; then
+    failed=1
+  fi
+
+  check_cron
+
+  if [ "$failed" -ne 0 ]; then
+    fail 'Host-side services are not ready.'
+    exit 1
+  fi
+
+  run_optional_sync
+  ok 'Host-side services are ready.'
+}
+
+main "$@"
